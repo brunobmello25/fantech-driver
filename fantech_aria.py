@@ -36,6 +36,7 @@ CHECKSUM_MAGIC = 0x55
 # Config memory layout (bank 0)
 OFFSET_POLLING_RATE = 0x00
 OFFSET_DPI_BASE = 0x0C  # 7 slots, 4 bytes each
+OFFSET_DPI_COLOR_BASE = 0x2C  # 7 slots, 4 bytes each (R, G, B, checksum)
 OFFSET_BUTTON_CONFIG = 0x60  # 4 bytes per button, 11 buttons
 OFFSET_LOD = 0xA0
 OFFSET_ANGLE_SNAP = 0xA9
@@ -174,6 +175,20 @@ def decode_polling_rate(data: bytes) -> int:
     if val == 0:
         return 0
     return 1000 // val
+
+
+def encode_rgb(r: int, g: int, b: int) -> bytes:
+    """Encode an RGB color into 4-byte wire format: [R, G, B, checksum]."""
+    for label, val in [("R", r), ("G", g), ("B", b)]:
+        if val < 0 or val > 255:
+            raise ValueError(f"{label}={val} invalid. Must be 0-255.")
+    chk = (CHECKSUM_MAGIC - r - g - b) & 0xFF
+    return bytes([r, g, b, chk])
+
+
+def decode_rgb(data: bytes) -> tuple[int, int, int]:
+    """Decode 4-byte color data into (R, G, B)."""
+    return data[0], data[1], data[2]
 
 
 def encode_debounce(ms: int) -> bytes:
@@ -383,6 +398,56 @@ class FantechAria:
             raise IOError("No response from device")
         self._save()
 
+    def get_dpi_colors(self) -> list[tuple[int, int, int]]:
+        """Read all 7 DPI slot LED colors. Returns list of (R, G, B) tuples."""
+        self._poll_ready()
+        result = []
+        for slot in range(DPI_SLOT_COUNT):
+            offset = OFFSET_DPI_COLOR_BASE + slot * DPI_SLOT_SIZE
+            data = self._read_config(0, offset, DPI_SLOT_SIZE)
+            if data and len(data) >= 3:
+                result.append(decode_rgb(data))
+            else:
+                result.append((0, 0, 0))
+        return result
+
+    def set_dpi_color(self, slot: int, r: int, g: int, b: int):
+        """Set LED color for a DPI slot (0-6)."""
+        if slot < 0 or slot >= DPI_SLOT_COUNT:
+            raise ValueError(f"Slot must be 0-{DPI_SLOT_COUNT - 1}")
+        self._poll_ready()
+        data = encode_rgb(r, g, b)
+        offset = OFFSET_DPI_COLOR_BASE + slot * DPI_SLOT_SIZE
+        resp = self._write_config(0, offset, data)
+        if not resp:
+            raise IOError("No response from device")
+        self._save()
+
+    def set_all_dpi_colors(self, r: int, g: int, b: int):
+        """Set LED color for all 7 DPI slots."""
+        self._poll_ready()
+        data = encode_rgb(r, g, b)
+        for slot in range(DPI_SLOT_COUNT):
+            offset = OFFSET_DPI_COLOR_BASE + slot * DPI_SLOT_SIZE
+            resp = self._write_config(0, offset, data)
+            if not resp:
+                raise IOError("No response from device")
+        self._save()
+
+    def lights_off(self):
+        """Turn off all DPI slot LEDs by setting RGB to (0, 0, 0)."""
+        self.set_all_dpi_colors(0, 0, 0)
+
+    def get_battery(self) -> int:
+        """Read battery level percentage via HID feature report 0x06.
+
+        Returns battery percentage (0-100).
+        """
+        resp = self.device.get_feature_report(0x06, 9)
+        if resp and len(resp) >= 4:
+            return resp[3]
+        return -1
+
     def set_button_combo(self, button: int, modifiers: list[int],
                          keycode: int):
         """Remap a mouse button to a keyboard key combo.
@@ -477,7 +542,10 @@ def print_status(mouse: FantechAria):
     print("Fantech Aria XD7 - Current Configuration")
     print("=" * 42)
 
-    print(f"\nPolling Rate:   {mouse.get_polling_rate()} Hz")
+    battery = mouse.get_battery()
+    if battery >= 0:
+        print(f"\nBattery:        {battery}%")
+    print(f"Polling Rate:   {mouse.get_polling_rate()} Hz")
     print(f"Debounce:       {mouse.get_debounce()} ms")
     print(f"Angle Snapping: {mouse.get_angle_snap()}")
     lod = mouse.get_lod()
@@ -486,9 +554,11 @@ def print_status(mouse: FantechAria):
 
     print(f"\nDPI Slots:")
     dpis = mouse.get_dpi_all()
-    for i, (dx, dy) in enumerate(dpis):
+    colors = mouse.get_dpi_colors()
+    for i, ((dx, dy), (r, g, b)) in enumerate(zip(dpis, colors)):
         xy = f"{dx}" if dx == dy else f"{dx}x{dy}"
-        print(f"  Slot {i}: {xy}")
+        color = "off" if r == 0 and g == 0 and b == 0 else f"({r},{g},{b})"
+        print(f"  Slot {i}: {xy:<12s}  LED: {color}")
 
 
 def cmd_status(args):
@@ -565,6 +635,42 @@ def cmd_lod(args):
             print(f"Set lift-off distance to {args.value} ({label})")
 
 
+def cmd_lights(args):
+    with FantechAria() as mouse:
+        if args.off:
+            mouse.lights_off()
+            print("All DPI slot LEDs turned off")
+        elif args.color:
+            parts = args.color.split(",")
+            if len(parts) != 3:
+                print("Color must be R,G,B (e.g. 255,0,0)", file=sys.stderr)
+                sys.exit(1)
+            r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+            if args.slot is not None:
+                mouse.set_dpi_color(args.slot, r, g, b)
+                print(f"Set slot {args.slot} LED to ({r}, {g}, {b})")
+            else:
+                mouse.set_all_dpi_colors(r, g, b)
+                print(f"Set all DPI slot LEDs to ({r}, {g}, {b})")
+        else:
+            # Read mode
+            colors = mouse.get_dpi_colors()
+            for i, (r, g, b) in enumerate(colors):
+                if r == 0 and g == 0 and b == 0:
+                    print(f"  Slot {i}: off")
+                else:
+                    print(f"  Slot {i}: ({r}, {g}, {b})")
+
+
+def cmd_battery(args):
+    with FantechAria() as mouse:
+        level = mouse.get_battery()
+        if level >= 0:
+            print(f"Battery: {level}%")
+        else:
+            print("Could not read battery level.")
+
+
 def cmd_button(args):
     with FantechAria() as mouse:
         if args.key:
@@ -610,6 +716,11 @@ examples:
   %(prog)s angle-snap 10              Set angle snapping to 10
   %(prog)s lod                        Show lift-off distance
   %(prog)s lod 1                      Set lift-off distance to 1 (low)
+  %(prog)s lights                       Show DPI slot LED colors
+  %(prog)s lights --off                 Turn off all LEDs
+  %(prog)s lights --color 255,0,0       Set all LEDs to red
+  %(prog)s lights --color 0,0,255 --slot 2  Set slot 2 LED to blue
+  %(prog)s battery                      Show battery/power info
   %(prog)s button 3 --key a             Remap back button to 'a' key
   %(prog)s button 3 --key super+tab    Remap back button to Super+Tab
   %(prog)s button 3 --key ctrl+shift+z Remap back button to Ctrl+Shift+Z
@@ -647,6 +758,16 @@ examples:
     lod_parser.add_argument("value", type=int, nargs="?",
                             help="1 (low/1mm) or 2 (high/2mm)")
 
+    lights_parser = sub.add_parser("lights", help="Get/set DPI slot LED colors")
+    lights_parser.add_argument("--off", action="store_true",
+                               help="Turn off all DPI slot LEDs")
+    lights_parser.add_argument("--color", type=str,
+                               help="Set LED color as R,G,B (0-255 each)")
+    lights_parser.add_argument("--slot", type=int, default=None,
+                               help="Target a specific DPI slot (0-6)")
+
+    sub.add_parser("battery", help="Read battery/power info (experimental)")
+
     button_parser = sub.add_parser("button", help="Remap mouse buttons")
     button_parser.add_argument("button", type=int, help="Button index (0-10)")
     button_group = button_parser.add_mutually_exclusive_group()
@@ -679,6 +800,8 @@ examples:
         "debounce": cmd_debounce,
         "angle-snap": cmd_angle_snap,
         "lod": cmd_lod,
+        "lights": cmd_lights,
+        "battery": cmd_battery,
         "button": cmd_button,
         "dump": cmd_dump,
         "udev-rule": cmd_udev_rule,
